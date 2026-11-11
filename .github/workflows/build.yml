@@ -1,6 +1,12 @@
 name: Build apps
 
+# Publish a release (tag like v1.2.0) and this builds:
+#   DrawFont-Setup.exe             Windows installer (also what auto-update downloads)
+#   DrawFont-Windows-portable.exe  Windows, no install
+#   DrawFont-Android.apk           Android app
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -16,52 +22,87 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt pillow
+      - run: pip install -r requirements.txt
       - run: python -m unittest discover -s . -p "test_*.py"
 
-  build:
+  windows:
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            asset: DrawFont-Windows.exe
-          - os: macos-latest
-            asset: DrawFont-macOS.zip
-          - os: ubuntu-22.04
-            asset: DrawFont-Linux
-    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'push'
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Linux Tk
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - name: Put the release number into the app
+        shell: bash
+        run: |
+          VER="${TAG#v}"
+          if [ -z "$VER" ]; then VER="0.0.0"; fi
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          sed -i "s/^__version__ = .*/__version__ = \"$VER\"/" version.py
+          cat version.py
       - run: pip install -r requirements.txt pyinstaller
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
+      - name: Build the app
+        run: pyinstaller --onefile --windowed --name DrawFont --collect-submodules fontTools drawfont.py
+      - name: Build the installer
+        shell: pwsh
         run: |
-          pyinstaller --onefile --windowed --name DrawFont drawfont.py
-          move dist\DrawFont.exe dist\DrawFont-Windows.exe
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          pyinstaller --windowed --name DrawFont drawfont.py
-          cd dist && zip -r DrawFont-macOS.zip DrawFont.app
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          pyinstaller --onefile --name DrawFont drawfont.py
-          mv dist/DrawFont dist/DrawFont-Linux
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$env:VERSION" installer\drawfont.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item dist\DrawFont.exe dist\DrawFont-Windows-portable.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
-      - name: Attach to release
+          name: DrawFont-Windows
+          path: |
+            dist/DrawFont-Setup.exe
+            dist/DrawFont-Windows-portable.exe
+      - name: Attach to the release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.asset }}
+          files: |
+            dist/DrawFont-Setup.exe
+            dist/DrawFont-Windows-portable.exe
+
+  android:
+    needs: test
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Build the APK
+        working-directory: android
+        run: |
+          VER="${TAG#v}"
+          if [ -z "$VER" ]; then VER="0.0.0"; fi
+          gradle --no-daemon assembleRelease -PappVersion="$VER" -PappVersionCode="${{ github.run_number }}"
+      - name: Collect the APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk dist/DrawFont-Android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DrawFont-Android
+          path: dist/DrawFont-Android.apk
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DrawFont-Android.apk
