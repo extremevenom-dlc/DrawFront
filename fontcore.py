@@ -16,10 +16,12 @@ from __future__ import annotations
 import json
 import math
 import string
+import zlib
 
 from fontTools.agl import UV2AGL
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.ttLib import TTFont, newTable
 
 # --------------------------------------------------------------------------- constants
 
@@ -43,6 +45,7 @@ DEFAULT_SETTINGS = {
     "spacing": "auto",     # "auto" = fit to ink, "fixed" = monospace
     "fixed_advance": 600,  # letter width for "fixed" spacing
     "space_width": 300,    # width of the space character
+    "latin_aliases": False,  # PUA projects: ALSO make the plain keys (a, B, 5...) show your letters
 }
 
 PROJECT_FORMAT = "drawfont-project"
@@ -51,6 +54,10 @@ PROJECT_VERSION = 1
 _RDP_EPS = 1.2            # simplification tolerance in font units (invisible at 1000 upm)
 _JOIN_COS = math.cos(math.radians(25))  # turns sharper than 25 degrees get a round join
 _UNDO_LIMIT = 300
+FONT_SOURCE_TAG = "DRFT"      # private font table that carries your drawings inside the .ttf
+_SOURCE_MAGIC = b"DRF1"
+_SOURCE_MAX = 64 * 1024 * 1024   # refuse absurdly large payloads (zip-bomb guard)
+PUA_START, PUA_END = 0xE000, 0xF8FF   # private-use area: safe home for your own alphabet
 _OVERLAP = 1.5            # units each segment extends past its ends (hides rounding seams)
 
 
@@ -215,6 +222,9 @@ class Project:
         self.settings = dict(DEFAULT_SETTINGS)
         self.charset = list(DEFAULT_CHARSET)
         self.glyphs = {}          # char -> [ {"w": width, "pts": [[x, y], ...]}, ... ]
+        self.pua = False          # True = every character lives in the private-use area (see new_pua)
+        self.labels = {}          # char -> display name (for custom symbols that no font shows)
+        self.keymap = {}          # keyboard key -> char typed by it in your own keyboard layout
         self._undo = []           # [(char, snapshot of that char's strokes)]
         self._cache = {}
         self.dirty = False
@@ -236,16 +246,85 @@ class Project:
         seen = list(self.charset) + [c for c in self.glyphs if c not in self.charset]
         return [c for c in seen if self.glyphs.get(c)]
 
+    @classmethod
+    def new_pua(cls, name="MyHandwriting"):
+        """
+        A project where EVERY character is your own: each of the 94 keys of a standard US QWERTY
+        keyboard gets a private-use code point, in the fixed order of DEFAULT_CHARSET:
+        A-Z = U+E000..E019, a-z = U+E01A..E033, 0-9 = U+E034..E03D, punctuation = U+E03E..E05D.
+        The keyboard layout (kblayout.py) makes each QWERTY key type its code point.
+        """
+        p = cls(name)
+        p.pua = True
+        p.charset = []
+        for i, key in enumerate(DEFAULT_CHARSET):
+            ch = chr(PUA_START + i)
+            p.charset.append(ch)
+            p.labels[ch] = key
+            p.keymap[key] = ch
+        p.dirty = False
+        return p
+
     def add_chars(self, text):
+        """Add extra characters. In a PUA project each one becomes a new private-use symbol."""
         added = []
         for ch in text:
             if ch.isspace() or ch in self.charset:
                 continue
-            self.charset.append(ch)
-            added.append(ch)
+            if self.pua:
+                if ch in self.labels.values():
+                    continue
+                added.append(self.new_symbol(ch, None))
+            else:
+                self.charset.append(ch)
+                added.append(ch)
         if added:
             self.dirty = True
         return added
+
+    # ---- your own alphabet: custom symbols + keyboard keys
+    def display_name(self, ch):
+        return self.labels.get(ch, ch)
+
+    @staticmethod
+    def _check_key(key):
+        if key and (len(key) != 1 or key.isspace()):
+            raise ValueError("A keyboard key must be exactly one character (like k, or K for Shift+K).")
+
+    def new_symbol(self, label, key=None):
+        """Create a brand-new character in the Unicode private-use area (U+E000...)."""
+        key = (key or "").strip()
+        self._check_key(key)
+        used = set(self.charset) | set(self.glyphs)
+        cp = PUA_START
+        while chr(cp) in used:
+            cp += 1
+        if cp > PUA_END:
+            raise ValueError("Too many custom symbols (the limit is 6400).")
+        ch = chr(cp)
+        self.charset.append(ch)
+        self.labels[ch] = (label or "").strip() or f"Symbol {cp - PUA_START + 1}"
+        if key:
+            self.set_key(ch, key)
+        self.dirty = True
+        return ch
+
+    def set_key(self, ch, key):
+        """Make `key` type `ch` in your keyboard layout. An empty key removes the mapping."""
+        key = (key or "").strip()
+        self._check_key(key)
+        for k in [k for k, v in self.keymap.items() if v == ch or k == key]:
+            del self.keymap[k]
+        if key:
+            self.keymap[key] = ch
+        self.dirty = True
+
+    def key_for(self, ch):
+        return next((k for k, v in self.keymap.items() if v == ch), "")
+
+    def translate(self, text):
+        """Type `text` on a normal keyboard -> what your keyboard layout would produce."""
+        return "".join(self.keymap.get(c, c) for c in text)
 
     # ---- editing (each edit is undoable)
     def _snapshot(self, ch):
@@ -332,6 +411,7 @@ class Project:
             "format": PROJECT_FORMAT, "version": PROJECT_VERSION, "name": self.name,
             "settings": self.settings, "charset": "".join(self.charset),
             "glyphs": {c: s for c, s in self.glyphs.items() if s},
+            "labels": self.labels, "keymap": self.keymap, "pua": self.pua,
         }
 
     @classmethod
@@ -350,8 +430,36 @@ class Project:
                     clean.append({"w": float(st["w"]), "pts": pts})
             if clean:
                 p.glyphs[ch] = clean
+        for ch in p.glyphs:                       # drawn characters always stay in the list
+            if ch not in p.charset:
+                p.charset.append(ch)
+        p.pua = bool(d.get("pua", False))
+        for src, dst in ((d.get("labels"), p.labels), (d.get("keymap"), p.keymap)):
+            if isinstance(src, dict):
+                dst.update({str(k): str(v) for k, v in src.items() if k and v})
         p.dirty = False
         return p
+
+    @classmethod
+    def from_font(cls, path):
+        """Recover the editable drawings from a .ttf that DrawFont exported (any device)."""
+        try:
+            with open(path, "rb") as fh:
+                raw = TTFont(fh, lazy=True).reader[FONT_SOURCE_TAG]
+        except KeyError:
+            raise ValueError("This font was not made with DrawFont, so its drawings can't be opened.") from None
+        except Exception as ex:
+            raise ValueError("That file is not a font DrawFont can read.") from ex
+        try:
+            if raw[:4] != _SOURCE_MAGIC:
+                raise ValueError("unknown format")
+            d = zlib.decompressobj()
+            data = d.decompress(raw[4:], _SOURCE_MAX)
+            if d.unconsumed_tail:
+                raise ValueError("too large")
+            return cls.from_dict(json.loads(data.decode("utf-8")))
+        except Exception as ex:
+            raise ValueError("The drawings inside this font are damaged or from a newer DrawFont.") from ex
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
@@ -397,8 +505,17 @@ def _pen_glyph(polys):
     return pen.glyph()
 
 
-def build_font(project, path):
-    """Write `project` to a .ttf file at `path`. Returns a small summary dict."""
+def _pack_source(project):
+    text = json.dumps(project.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    return _SOURCE_MAGIC + zlib.compress(text.encode("utf-8"), 9)
+
+
+def build_font(project, path, embed_source=True):
+    """
+    Write `project` to a .ttf file at `path`. Returns a small summary dict.
+    With embed_source (default) the editable drawings travel inside the font in a private
+    table: apps ignore it, but DrawFont can open the .ttf to keep editing on any device.
+    """
     chars = [c for c in project.drawn_chars() if c != " "]
     if not chars:
         raise ValueError("Draw at least one character before exporting.")
@@ -423,6 +540,12 @@ def build_font(project, path):
         advances[name] = int(round(adv))
         cmap[ord(ch)] = name
         order.append(name)
+
+    if project.settings.get("latin_aliases"):          # opt-in: plain keys also show your letters
+        for key, ch in project.keymap.items():
+            target = cmap.get(ord(ch))
+            if target and ord(key) not in cmap:
+                cmap[ord(key)] = target
 
     family = project.name.strip() or "MyHandwriting"
     fb = FontBuilder(UPM, isTTF=True)
@@ -450,5 +573,57 @@ def build_font(project, path):
                 usWinAscent=top, usWinDescent=-bottom, sxHeight=X_HEIGHT,
                 sCapHeight=CAP_HEIGHT, usWeightClass=400, achVendID="DRWF", fsType=0)
     fb.setupPost()
+    if embed_source:
+        table = newTable(FONT_SOURCE_TAG)
+        table.data = _pack_source(project)
+        fb.font[FONT_SOURCE_TAG] = table
     fb.save(path)
     return {"glyphs": len(chars), "path": path, "family": family}
+
+
+# --------------------------------------------------------------------------- text -> picture
+
+def render_png(project, text, path, height=256, color=(0, 0, 0), background=None,
+               use_keymap=False, padding=0.12):
+    """
+    Draw `text` in your handwriting and save it as a PNG (for sharing in chats, where
+    other people's apps can't show your font). background=None gives a transparent PNG.
+    `height` is the pixel height of one line's em box. Returns (width, height) in pixels.
+    Needs Pillow (imported here so the rest of the app works without it).
+    """
+    from PIL import Image, ImageDraw
+
+    if use_keymap:
+        text = project.translate(text)
+    line_h = ASCENDER - DESCENDER + 100
+    polys, widest = [], 0.0
+    lines = text.split("\n")[:50]
+    for i, line in enumerate(lines):
+        lp, adv = project.layout(line)
+        polys.extend([[(x, y - i * line_h) for x, y in p] for p in lp])
+        widest = max(widest, adv)
+    if not polys:
+        raise ValueError("Nothing to draw: none of those characters has been drawn yet.")
+
+    k = height / float(ASCENDER - DESCENDER)
+    pad = int(height * padding)
+    w = int(widest * k) + 2 * pad
+    h = int(((len(lines) - 1) * line_h + (ASCENDER - DESCENDER)) * k) + 2 * pad
+    if w > 16000 or h > 16000:
+        raise ValueError("That text is too long for one picture. Use fewer characters or a smaller height.")
+
+    S = 3                                              # supersampling: smooth edges
+    mask = Image.new("L", (w * S, h * S), 0)
+    draw = ImageDraw.Draw(mask)
+    for poly in polys:
+        draw.polygon([((pad + x * k) * S, (pad + (ASCENDER - y) * k) * S) for x, y in poly], fill=255)
+    mask = mask.resize((w, h), Image.LANCZOS)
+    ink = Image.new("RGBA", (w, h), tuple(color) + (255,))
+    ink.putalpha(mask)
+    if background is None:
+        out = ink
+    else:
+        out = Image.new("RGBA", (w, h), tuple(background) + (255,))
+        out.alpha_composite(ink)
+    out.save(path, "PNG")
+    return w, h
