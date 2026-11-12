@@ -69,3 +69,7 @@ val syncCore by tasks.registering(Copy::class) {
     into(layout.projectDirectory.dir("src/main/python"))
 }
 tasks.named("preBuild") { dependsOn(syncCore) }
+// Gradle 8 insists this is explicit: Chaquopy's "merge Python sources" step reads the folder syncCore writes into.
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("PythonSources") }.configureEach {
+    dependsOn(syncCore)
+}
